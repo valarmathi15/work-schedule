@@ -337,8 +337,14 @@ st.title("Work Tracker")
 st.caption(date.today().strftime("%A, %d %B %Y"))
 with st.sidebar:
     search = st.text_input("Search all tabs")
-    st.download_button("Download as Excel", export_excel(), file_name="work_tracker.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    try:
+        st.download_button("Download as Excel", export_excel(), file_name="work_tracker.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except ImportError:
+        # openpyxl is not installed (add it to requirements.txt); fall back to CSV so the app still runs
+        rows = q("SELECT tab,grp,title,kind,status,added,due,done_at FROM items")
+        st.download_button("Download as CSV", pd.DataFrame([dict(r) for r in rows]).to_csv(index=False),
+                           file_name="work_tracker.csv", mime="text/csv")
     st.caption(f"Data file: {DB_PATH}")
 
 tabs = st.tabs(["Overview"] + [c["nav"] for c in CFG.values()] + ["Activity log"])
