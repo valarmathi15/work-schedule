@@ -1,4 +1,4 @@
-"""Work Tracker: Streamlit + SQLite.
+"""Work Tracker (multi-employee): Streamlit + SQLite.
 
 Run:  pip install -r requirements.txt
       streamlit run app.py
@@ -54,6 +54,14 @@ def conn():
             title TEXT, action TEXT, detail TEXT);
         """
     )
+    c.executescript("CREATE TABLE IF NOT EXISTS employees(name TEXT PRIMARY KEY);")
+    for t in ("items", "daily", "log"):
+        if "owner" not in [r[1] for r in c.execute(f"PRAGMA table_info({t})")]:
+            c.execute(f"ALTER TABLE {t} ADD COLUMN owner TEXT")
+    if c.execute("SELECT 1 FROM items WHERE owner IS NULL UNION SELECT 1 FROM daily WHERE owner IS NULL").fetchone():
+        for t in ("items", "daily", "log"):
+            c.execute(f"UPDATE {t} SET owner='Me' WHERE owner IS NULL")
+        c.execute("INSERT OR IGNORE INTO employees(name) VALUES('Me')")
     c.commit()
     return c
 
@@ -73,9 +81,17 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
-def log(tab, title, action, detail="", item_id=None):
-    x("INSERT INTO log(ts,item_id,tab,title,action,detail) VALUES(?,?,?,?,?,?)",
-      (now(), item_id, tab, title, action, detail))
+TEAM = "👥 Team overview"
+
+
+def emp():
+    v = st.session_state.get("view")
+    return None if v == TEAM else v
+
+
+def log(tab, title, action, detail="", item_id=None, owner=None):
+    x("INSERT INTO log(ts,item_id,tab,title,action,detail,owner) VALUES(?,?,?,?,?,?,?)",
+      (now(), item_id, tab, title, action, detail, owner or emp()))
 
 
 def get(i):
@@ -109,8 +125,8 @@ def when_text(it):
 
 # ---------- callbacks (each one saves + logs) ----------
 def add_item(tab, grp, title, kind, status, added, due):
-    cur = x("INSERT INTO items(tab,grp,title,kind,status,added,due,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (tab, grp, title, kind, status, added.isoformat(), due.isoformat() if due else None, now()))
+    cur = x("INSERT INTO items(tab,grp,title,kind,status,added,due,created_at,owner) VALUES(?,?,?,?,?,?,?,?,?)",
+            (tab, grp, title, kind, status, added.isoformat(), due.isoformat() if due else None, now(), emp()))
     log(tab, title, "Added", f"Added date {added.isoformat()}" + (f", due {due.isoformat()}" if due else ""), cur.lastrowid)
 
 
@@ -146,6 +162,12 @@ def on_note(i, key):
         st.session_state[key] = ""
 
 
+def on_owner(i, key):
+    it, new = get(i), st.session_state[key]
+    x("UPDATE items SET owner=? WHERE id=?", (new, i))
+    log(it["tab"], it["title"], "Reassigned", f"{it['owner']} → {new}", i, owner=it["owner"])
+
+
 def on_remove(i):
     it = get(i)
     x("DELETE FROM notes WHERE item_id=?", (i,))
@@ -156,7 +178,7 @@ def on_remove(i):
 def on_daily_add(key):
     t = st.session_state[key].strip()
     if t:
-        x("INSERT INTO daily(title) VALUES(?)", (t,))
+        x("INSERT INTO daily(title,owner) VALUES(?,?)", (t, emp()))
         log("daily", t, "Daily item added")
         st.session_state[key] = ""
 
@@ -206,6 +228,10 @@ def render_item(it, tab):
                       key=f"ad_{i}", on_change=on_date, args=(i, "added", f"ad_{i}"))
         d2.date_input("Due date", value=date.fromisoformat(it["due"]) if it["due"] else None,
                       key=f"du_{i}", on_change=on_date, args=(i, "due", f"du_{i}"))
+        names = [r["name"] for r in q("SELECT name FROM employees ORDER BY name")]
+        if len(names) > 1:
+            st.selectbox("Assigned to", names, index=names.index(it["owner"]) if it["owner"] in names else 0,
+                         key=f"ow_{i}", on_change=on_owner, args=(i, f"ow_{i}"))
         for n in q("SELECT * FROM notes WHERE item_id=? ORDER BY id", (i,)):
             st.markdown(f"- _{fmt_dt(n['ts'])}_ — {n['text']}")
         st.text_input("Add note: what did you do?", key=f"nt_{i}", on_change=on_note, args=(i, f"nt_{i}"))
@@ -226,8 +252,8 @@ def tab_view(tab, search):
         if st.form_submit_button("Add", type="primary") and title.strip():
             add_item(tab, grp.strip(), title.strip(), kind, status, added, due)
 
-    rows = q("SELECT * FROM items WHERE tab=? AND done_at IS NULL ORDER BY (due IS NULL), due, id DESC", (tab,))
-    hist = q("SELECT * FROM items WHERE tab=? AND done_at IS NOT NULL ORDER BY done_at DESC", (tab,))
+    rows = q("SELECT * FROM items WHERE tab=? AND owner=? AND done_at IS NULL ORDER BY (due IS NULL), due, id DESC", (tab, emp()))
+    hist = q("SELECT * FROM items WHERE tab=? AND owner=? AND done_at IS NOT NULL ORDER BY done_at DESC", (tab, emp()))
     if search:
         s = search.lower()
         rows = [r for r in rows if s in f"{r['grp']} {r['title']}".lower()]
@@ -257,8 +283,8 @@ def tab_view(tab, search):
 
 def overview():
     today = date.today()
-    open_n = lambda t, extra="": q(f"SELECT COUNT(*) n FROM items WHERE tab=? AND done_at IS NULL {extra}", (t,))[0]["n"]
-    fin = q("SELECT added, done_at FROM items WHERE done_at IS NOT NULL AND added IS NOT NULL")
+    open_n = lambda t, extra="": q(f"SELECT COUNT(*) n FROM items WHERE tab=? AND owner=? AND done_at IS NULL {extra}", (t, emp()))[0]["n"]
+    fin = q("SELECT added, done_at FROM items WHERE owner=? AND done_at IS NOT NULL AND added IS NOT NULL", (emp(),))
     avg = (sum((datetime.fromisoformat(r["done_at"]).date() - date.fromisoformat(r["added"])).days for r in fin) / len(fin)) if fin else None
     m = st.columns(6)
     m[0].metric("Open work items", open_n("work", "AND status!='future'"))
@@ -271,7 +297,7 @@ def overview():
     left, right = st.columns([1.2, 1])
     with left:
         st.subheader("Due today and overdue")
-        due = q("SELECT * FROM items WHERE done_at IS NULL AND due IS NOT NULL AND due<=? ORDER BY due", (today.isoformat(),))
+        due = q("SELECT * FROM items WHERE owner=? AND done_at IS NULL AND due IS NOT NULL AND due<=? ORDER BY due", (emp(), today.isoformat()))
         if due:
             for r in due:
                 late = date.fromisoformat(r["due"]) < today
@@ -283,7 +309,7 @@ def overview():
             st.caption("Nothing due. Set a due date on a task and it shows up here.")
     with right:
         st.subheader("Daily checklist")
-        items = q("SELECT * FROM daily ORDER BY id")
+        items = q("SELECT * FROM daily WHERE owner=? ORDER BY id", (emp(),))
         ticked = {r["daily_id"] for r in q("SELECT daily_id FROM daily_log WHERE day=?", (today.isoformat(),))}
         if items:
             st.progress(len([d for d in items if d["id"] in ticked]) / len(items),
@@ -297,7 +323,7 @@ def overview():
 
     st.subheader("Project progress")
     prog = q("""SELECT grp, COUNT(*) total, SUM(done_at IS NOT NULL) done FROM items
-                WHERE tab='work' AND kind='Project' GROUP BY grp""")
+                WHERE tab='work' AND kind='Project' AND owner=? GROUP BY grp""", (emp(),))
     if prog:
         for p in prog:
             st.progress(p["done"] / p["total"], text=f"{p['grp'] or 'No name'}: {p['done']}/{p['total']}")
@@ -308,7 +334,7 @@ def overview():
 def activity_log():
     st.subheader("Activity log")
     st.caption("Every add, edit, status change, note, completion and removal, newest first.")
-    rows = q("SELECT ts, tab, title, action, detail FROM log ORDER BY id DESC LIMIT 1000")
+    rows = q("SELECT ts, tab, title, action, detail FROM log WHERE owner=? ORDER BY id DESC LIMIT 1000", (emp(),))
     if not rows:
         st.info("No activity yet.")
         return
@@ -322,36 +348,106 @@ def activity_log():
 def export_excel():
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        cols = ["owner", "grp", "title", "kind", "status", "added", "due", "done_at"]
         for t, cfg in CFG.items():
-            df = pd.DataFrame([dict(r) for r in q("SELECT grp,title,kind,status,added,due,done_at FROM items WHERE tab=?", (t,))],
-                              columns=["grp", "title", "kind", "status", "added", "due", "done_at"])
-            df.columns = ["Project/Client", "Task/Plan", "Type", "Status", "Added", "Due", "Completed at"]
+            df = pd.DataFrame([dict(r) for r in q(f"SELECT {','.join(cols)} FROM items WHERE tab=? ORDER BY owner", (t,))], columns=cols)
+            df.columns = ["Employee", "Project/Client", "Task/Plan", "Type", "Status", "Added", "Due", "Completed at"]
             df.to_excel(w, sheet_name=cfg["nav"], index=False)
-        pd.DataFrame([dict(r) for r in q("SELECT ts,tab,title,action,detail FROM log ORDER BY id DESC")],
-                     columns=["ts", "tab", "title", "action", "detail"]).to_excel(w, sheet_name="Activity log", index=False)
+        lc = ["ts", "owner", "tab", "title", "action", "detail"]
+        pd.DataFrame([dict(r) for r in q(f"SELECT {','.join(lc)} FROM log ORDER BY id DESC")], columns=lc).to_excel(
+            w, sheet_name="Activity log", index=False)
     return buf.getvalue()
 
 
+def team_overview(employees):
+    today = date.today()
+    st.subheader("Workload by employee")
+    data = []
+    for e in employees:
+        n = lambda sql, *a: q(sql, (e, *a))[0]["n"]
+        fin = q("SELECT added, done_at FROM items WHERE owner=? AND done_at IS NOT NULL AND added IS NOT NULL", (e,))
+        avg = sum((datetime.fromisoformat(r["done_at"]).date() - date.fromisoformat(r["added"])).days for r in fin) / len(fin) if fin else None
+        data.append({
+            "Employee": e,
+            "Work plan": n("SELECT COUNT(*) n FROM items WHERE owner=? AND tab=? AND done_at IS NULL", "work"),
+            "Follow-ups": n("SELECT COUNT(*) n FROM items WHERE owner=? AND tab=? AND done_at IS NULL", "follow"),
+            "Execution": n("SELECT COUNT(*) n FROM items WHERE owner=? AND tab=? AND done_at IS NULL", "exec"),
+            "Mutual funds": n("SELECT COUNT(*) n FROM items WHERE owner=? AND tab=? AND done_at IS NULL", "mf"),
+            "Overdue": n("SELECT COUNT(*) n FROM items WHERE owner=? AND done_at IS NULL AND due<?", today.isoformat()),
+            "Completed": n("SELECT COUNT(*) n FROM items WHERE owner=? AND done_at IS NOT NULL"),
+            "Avg days to finish": round(avg, 1) if avg is not None else None,
+        })
+    st.dataframe(pd.DataFrame(data), hide_index=True)
+
+    pick = st.multiselect("Show employees", employees, default=employees)
+    st.subheader("Open items")
+    rows = q("SELECT * FROM items WHERE done_at IS NULL ORDER BY owner, (due IS NULL), due")
+    open_df = [{"Employee": r["owner"], "Section": CFG[r["tab"]]["nav"], "Project / client": r["grp"], "Task": r["title"],
+                "Status": LAB.get(r["status"]), "Added": r["added"], "Due": r["due"],
+                "Open days": (today - date.fromisoformat(r["added"])).days if r["added"] else None}
+               for r in rows if r["owner"] in pick]
+    st.dataframe(pd.DataFrame(open_df), hide_index=True) if open_df else st.caption("No open items.")
+
+    st.subheader("Recently completed")
+    rows = q("SELECT * FROM items WHERE done_at IS NOT NULL ORDER BY done_at DESC LIMIT 100")
+    done_df = [{"Employee": r["owner"], "Section": CFG[r["tab"]]["nav"], "Project / client": r["grp"], "Task": r["title"],
+                "Added": r["added"], "Completed": fmt_dt(r["done_at"]),
+                "Took (days)": (datetime.fromisoformat(r["done_at"]).date() - date.fromisoformat(r["added"])).days if r["added"] else None}
+               for r in rows if r["owner"] in pick]
+    st.dataframe(pd.DataFrame(done_df), hide_index=True) if done_df else st.caption("Nothing completed yet.")
+
+
 # ---------- page ----------
-st.title("Work Tracker")
-st.caption(date.today().strftime("%A, %d %B %Y"))
+def add_emp():
+    name = " ".join(st.session_state["new_emp"].split())
+    if name:
+        same = [r["name"] for r in q("SELECT name FROM employees WHERE lower(name)=lower(?)", (name,))]
+        if not same:
+            x("INSERT INTO employees(name) VALUES(?)", (name,))
+        st.session_state["view"] = same[0] if same else name
+        st.session_state["new_emp"] = ""
+
+
+employees = [r["name"] for r in q("SELECT name FROM employees ORDER BY name")]
 with st.sidebar:
-    search = st.text_input("Search all tabs")
+    st.header("Team")
+    st.text_input("➕ Add employee: type name, press Enter", key="new_emp", on_change=add_emp)
+    employees = [r["name"] for r in q("SELECT name FROM employees ORDER BY name")]
+    options = [TEAM] + employees
+    if st.session_state.get("view") not in options:
+        st.session_state["view"] = employees[0] if employees else TEAM
+    open_cnt = {r["owner"]: r["n"] for r in q(
+        "SELECT owner, COUNT(*) n FROM items WHERE done_at IS NULL GROUP BY owner")}
+    st.radio("Click a name to open their work schedule", options, key="view",
+             format_func=lambda o: o if o == TEAM else f"{o}  ·  {open_cnt.get(o, 0)} open")
+    mode = "Team overview" if st.session_state["view"] == TEAM else "Employee work"
+    search = st.text_input("Search tabs") if mode == "Employee work" else ""
     try:
-        st.download_button("Download as Excel", export_excel(), file_name="work_tracker.xlsx",
+        st.download_button("Download all as Excel", export_excel(), file_name="work_tracker.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except ImportError:
-        # openpyxl is not installed (add it to requirements.txt); fall back to CSV so the app still runs
-        rows = q("SELECT tab,grp,title,kind,status,added,due,done_at FROM items")
-        st.download_button("Download as CSV", pd.DataFrame([dict(r) for r in rows]).to_csv(index=False),
+        rows = q("SELECT owner,tab,grp,title,kind,status,added,due,done_at FROM items")
+        st.download_button("Download all as CSV", pd.DataFrame([dict(r) for r in rows]).to_csv(index=False),
                            file_name="work_tracker.csv", mime="text/csv")
     st.caption(f"Data file: {DB_PATH}")
 
-tabs = st.tabs(["Overview"] + [c["nav"] for c in CFG.values()] + ["Activity log"])
-with tabs[0]:
-    overview()
-for t, tb in zip(CFG, tabs[1:-1]):
-    with tb:
-        tab_view(t, search)
-with tabs[-1]:
-    activity_log()
+if not employees:
+    st.title("Work Tracker")
+    st.info("Add your first employee in the sidebar to start.")
+    st.stop()
+
+if mode == "Team overview":
+    st.title("Team overview")
+    st.caption(date.today().strftime("%A, %d %B %Y"))
+    team_overview(employees)
+else:
+    st.title(f"Work Tracker · {emp()}")
+    st.caption(date.today().strftime("%A, %d %B %Y"))
+    tabs = st.tabs(["Overview"] + [c["nav"] for c in CFG.values()] + ["Activity log"])
+    with tabs[0]:
+        overview()
+    for t, tb in zip(CFG, tabs[1:-1]):
+        with tb:
+            tab_view(t, search)
+    with tabs[-1]:
+        activity_log()
