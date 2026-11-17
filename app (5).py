@@ -386,7 +386,10 @@ def team_overview(employees):
                 "Status": LAB.get(r["status"]), "Added": r["added"], "Due": r["due"],
                 "Open days": (today - date.fromisoformat(r["added"])).days if r["added"] else None}
                for r in rows if r["owner"] in pick]
-    st.dataframe(pd.DataFrame(open_df), hide_index=True) if open_df else st.caption("No open items.")
+    if open_df:
+        st.dataframe(pd.DataFrame(open_df), hide_index=True)
+    else:
+        st.caption("No open items.")
 
     st.subheader("Recently completed")
     rows = q("SELECT * FROM items WHERE done_at IS NOT NULL ORDER BY done_at DESC LIMIT 100")
@@ -394,7 +397,10 @@ def team_overview(employees):
                 "Added": r["added"], "Completed": fmt_dt(r["done_at"]),
                 "Took (days)": (datetime.fromisoformat(r["done_at"]).date() - date.fromisoformat(r["added"])).days if r["added"] else None}
                for r in rows if r["owner"] in pick]
-    st.dataframe(pd.DataFrame(done_df), hide_index=True) if done_df else st.caption("Nothing completed yet.")
+    if done_df:
+        st.dataframe(pd.DataFrame(done_df), hide_index=True)
+    else:
+        st.caption("Nothing completed yet.")
 
 
 # ---------- page ----------
